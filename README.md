@@ -1,53 +1,38 @@
 # Apartment Lens · Vision service
 
-The photo and video side of [Apartment Lens](https://github.com/mcittkmims/apartment-lens). It is a Python worker with no API. It takes jobs from the `ops.job` table and writes results back. It collects photo evidence but never decides whether two ads are the same flat; the core service does that.
+The vision service handles photos and videos for [Apartment Lens](https://github.com/mcittkmims/apartment-lens). It is a Python worker without an API: it takes jobs from the `ops.job` table and writes its results back to the database. It collects evidence about photos but never decides whether two ads describe the same property; that decision belongs to the core service.
 
 > **Status:** design stage. This README describes the plan; there is no code yet.
 
-## Two workers, same code
+## Online and batch workers
 
-| Online worker (server, always on) | Batch worker (GPU machine, runs daily) |
-|---|---|
-| Fingerprints new photos within seconds | Vectors for the day's new photos |
-| Photo search (~1 s per photo, CPU) | Photo types (interior, exterior, render…) |
-| Video search (visual part) | Same-room checks on look-alike pairs |
-| | Re-indexing or fine-tuning, when needed |
+The same code runs as two workers with different responsibilities.
 
-- **The online worker** runs continuously and wakes up instantly through Postgres `LISTEN/NOTIFY`.
-- **The batch worker** is started manually once a day with `python -m worker --drain`. It takes every waiting job, processes it, and exits. It reaches the database over a private network.
+The online worker runs continuously on the server and handles everything that must happen within seconds. It fingerprints new photos and answers photo and video searches. PostgreSQL `LISTEN/NOTIFY` wakes it as soon as a job arrives, and it runs the image model on the CPU through ONNX Runtime.
 
-**Both workers must use the exact same DINOv2 model file.** It runs in PyTorch on the GPU machine and in ONNX Runtime on the server. Otherwise the online worker's searches won't line up with the vectors the batch worker built.
+The batch worker runs once a day on a GPU machine. It is started manually with `python -m worker --drain`, processes every waiting job, and exits. It computes vectors for the day's new photos, classifies each photo's role, and runs same-room checks on look-alike pairs. It reaches the database over a private network.
 
-## What each job does
+Both workers must load the exact same DINOv2 model file. The batch worker builds the vectors that are stored, and the online worker compares uploaded photos against them; if the two used different models, the vectors would not be comparable.
 
-| Job | Worker | What happens |
+## Jobs
+
+| Job | Worker | Description |
 |---|---|---|
-| Fingerprint | Online | PDQ hash, then near-identical photos are grouped. A group shared by ads with different floors or sizes is marked `building` (facades, renders, show-flat photos); the rest are `unit`. |
-| Vectors | Batch | DINOv2 ViT-S/14 turns each photo without a vector into 384 numbers, stored in pgvector. No job needed: the batch picks up every photo that lacks one. |
-| Photo types | Batch | SigLIP 2 labels each photo interior, exterior, render, floor plan, map or logo, from text prompts, with no training. |
-| Same-room check | Batch | LightGlue, only for new photos that look similar to an existing one but aren't copies. It counts how many points line up: many means the same room, few means a different room. The score is saved, so each pair is checked once. |
-| Photo search | Online | Vector of the upload, 50 nearest photos, grouped by flat, top 5 with confidence and matching photos. |
-| Video search | Online | Download a link with yt-dlp, keep one sharp frame per shot (ffmpeg, PySceneDetect), search each frame, then frames vote per flat. Below a minimum number of agreeing frames, the answer is "no confident match". |
+| Fingerprint | Online | Computes the PDQ hash of a new photo and groups near-identical photos into clusters. A cluster used by ads with different floors or areas is marked as building scope, because it contains facade, render or show-flat photos that many properties share. |
+| Vectors | Batch | Converts every photo that has no vector yet into a 384-dimensional DINOv2 vector and stores it in pgvector. This job needs no queue entries; the batch worker selects the photos itself. |
+| Photo role | Batch | Classifies each photo as interior, exterior, render, floor plan, map or logo with SigLIP 2, using text prompts and no training. |
+| Same-room check | Batch | Runs LightGlue on pairs of new and existing photos that look similar but are not copies, and stores how many points line up. Each pair is checked only once. |
+| Photo search | Online | Converts the uploaded photo into a vector, finds the 50 nearest listing photos, groups them by property, and returns the top five with their matching photos. |
+| Video search | Online | Downloads a linked video with yt-dlp, keeps one sharp frame per shot, searches each frame, and lets the frames vote for a property. Below a minimum number of agreeing frames, it reports that there is no confident match. |
 
-## Not in version 1
+## Scope of the first version
 
-- Same-room checks: added once tests show vectors alone make too many mistakes.
-- Fine-tuning DINOv2 on your own pairs.
-- Prices from videos (caption, then OCR, then Whisper).
+The first version includes fingerprints, vectors and both search types. Same-room checks will be added once measurements show that vectors alone produce too many wrong matches. Fine-tuning DINOv2 on the project's own photo pairs, and reading prices from video captions, on-screen text or speech, are possible later extensions.
 
-## Database
+## Data access
 
-- **Reads:** `ops.job`, `media`, `ingest` (to group results by flat), and photo storage.
-- **Writes:** hashes, types, vectors and scores in `media`; search results in `app`; jobs in `ops`.
+The worker reads jobs from `ops`, photos from `media` and photo storage, and ads from `ingest` to group results by property. It writes hashes, roles, vectors and check results to `media`, search results to `app`, and follow-up jobs to `ops`.
 
-## Tech
+## Technology
 
-| Purpose | Tool |
-|---|---|
-| Language | Python 3.12 |
-| Photo vectors | DINOv2 ViT-S/14 (PyTorch on the GPU machine, ONNX Runtime on the server) |
-| Near-copy hash | `pdqhash` |
-| Photo types | SigLIP 2 (`transformers`) |
-| Same-room check | LightGlue + ALIKED |
-| Images and video | Pillow, OpenCV, ffmpeg, PySceneDetect, yt-dlp |
-| Database | `psycopg`, `pgvector` |
+The worker uses Python 3.12. DINOv2 ViT-S/14 produces the image vectors, running in PyTorch on the GPU machine and in ONNX Runtime on the server. `pdqhash` computes perceptual hashes, SigLIP 2 from `transformers` classifies photo roles, and LightGlue with ALIKED features performs same-room checks. Pillow, OpenCV, ffmpeg, PySceneDetect and yt-dlp handle images and video, and `psycopg` with `pgvector` connects to the database.
